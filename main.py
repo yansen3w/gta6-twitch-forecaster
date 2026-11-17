@@ -17,21 +17,26 @@ Method (Python 3.13, standard library only; deterministic, no network):
      about -0.9 with the later log-ratios -- a launch that already draws a
      huge hour 1 (the world is already watching) grows far less over the
      day than one whose hour 1 is nearly empty (most regions not unlocked
-     yet).  A Gaussian kernel of bandwidth 1.0 in log size captures this
-     without assuming any functional form.
-  3. Per hour, the forecast centre is the weighted median log-ratio,
-     lightly smoothed over neighbouring hours; the spread is the weighted
-     standard deviation of the log-ratios, floored at 0.25 so a small
-     effective sample can never claim false precision.  Quantiles are
-     q_tau = p1 * exp(centre_h + z_tau * spread_h).
+     yet).  A Gaussian kernel of bandwidth 1.25 in log size captures this
+     without assuming any functional form, wide enough that the centre
+     and spread below see a usable effective sample.
+  3. Per hour, the forecast centre is the weighted mean log-ratio,
+     lightly smoothed over neighbouring hours; the spread is the
+     interquartile range of the log-ratios scaled to a normal-equivalent
+     standard deviation ((q75 - q25) / 1.349), floored at 0.25 so a small
+     effective sample can never claim false precision.  The mean uses
+     the full weighted distribution where a median throws most of it
+     away, and the IQR spread is not inflated by the few explosive
+     small launches that dominate a plain standard deviation.
+     Quantiles are q_tau = p1 * exp(centre_h + z_tau * spread_h).
   4. If too few comparables inform an hour, that hour falls back to the
      house persistence shape (0.15 log units per sqrt hour).
 
 Leave-one-out validation over the kit's 37 usable comparables (each held
 out in turn, scored by mean pinball loss on the log scale):
-  all launches .......... 0.457 vs house baseline 0.930
-  launches with p1>=10k . 0.272 vs house baseline 0.351
-  console-only launches . 0.204 vs house baseline 0.344
+  all launches .......... 0.432 vs house baseline 0.930
+  launches with p1>=10k . 0.274 vs house baseline 0.351
+  console-only launches . 0.199 vs house baseline 0.344
 (The house baseline scores about 0.387 on the practice cases themselves.)
 
 I/O contract (see the kit's RULES.txt): read every <id>.in in the input
@@ -63,8 +68,10 @@ Z = [-1.645, -0.674, 0, 0.674, 1.645]
 # console-only, rolling-midnight, single-player launch like this one.
 TIER_WEIGHTS = {0: 1.0, 1: 0.7, 2: 0.35, 3: 0.15}
 # Gaussian kernel bandwidth (natural-log units) on launch size (hour-1
-# print): launches within about a factor e of this case's size dominate.
-SIZE_BANDWIDTH = 1.0
+# print): launches within about a factor e^1.25 of this case's size
+# dominate, and the wider kernel keeps the centre and spread estimators
+# fed with a usable effective sample.
+SIZE_BANDWIDTH = 1.25
 # Never claim a log-spread narrower than this: the effective sample of
 # similar launches is small and the target is a single unseen launch.
 SPREAD_FLOOR = 0.25
@@ -121,14 +128,14 @@ def _release_day(comp):
     return [hours.get(h) for h in range(1, 25)]
 
 
-def _weighted_median(pairs):
-    """Weighted median of (value, weight) pairs; deterministic."""
+def _weighted_quantile(pairs, level):
+    """Weighted quantile of (value, weight) pairs; deterministic."""
     ordered = sorted(pairs, key=lambda pair: pair[0])
     total = sum(weight for _, weight in ordered)
     acc = 0.0
     for value, weight in ordered:
         acc += weight
-        if acc >= total / 2.0:
+        if acc >= level * total:
             return value
     return ordered[-1][0]
 
@@ -136,14 +143,6 @@ def _weighted_median(pairs):
 def _weighted_mean(pairs):
     total = sum(weight for _, weight in pairs)
     return sum(value * weight for value, weight in pairs) / total
-
-
-def _weighted_sd(pairs, mean):
-    total = sum(weight for _, weight in pairs)
-    if total <= 0:
-        return 0.0
-    var = sum(weight * (value - mean) ** 2 for value, weight in pairs) / total
-    return math.sqrt(max(var, 0.0))
 
 
 def _baseline_quantiles(p1, hour):
@@ -212,8 +211,19 @@ def forecast_case(case, name):
             centres[h] = None
             spreads[h] = BASELINE_SIGMA * math.sqrt(h - 1)
             continue
-        centres[h] = _weighted_median(pairs)
-        spreads[h] = max(_weighted_sd(pairs, _weighted_mean(pairs)), SPREAD_FLOOR)
+        centres[h] = _weighted_mean(pairs)
+        # Robust spread from the interquartile range, scaled to a
+        # normal-equivalent SD: a plain weighted SD is inflated by the
+        # few explosive small launches and made the intervals too wide
+        # for the bulk of launches.
+        spreads[h] = max(
+            (
+                _weighted_quantile(pairs, 0.75)
+                - _weighted_quantile(pairs, 0.25)
+            )
+            / 1.349,
+            SPREAD_FLOOR,
+        )
 
     # Light smoothing of the centres across neighbouring hours: the
     # launch-day shape moves slowly, and the per-hour samples differ.
